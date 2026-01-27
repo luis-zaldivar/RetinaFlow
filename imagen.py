@@ -1,4 +1,4 @@
-from PIL import Image
+#from PIL import Image
 from tkinter import Tk, filedialog
 from retinaface import RetinaFace
 import cv2
@@ -17,27 +17,39 @@ def PathImagen():
         return None
 
 
-def detectar_rostros(ruta_imagen):
-    # Carga la imagen
+def cargar_imagen(ruta_imagen):
+    # Carga la imagen usando OpenCV
     img = cv2.imread(ruta_imagen)
     
+    # Verifica si la imagen se cargó correctamente
+    if img is None:
+        raise ValueError(f"No se pudo cargar la imagen: {ruta_imagen}")
+    
+    return img
+
+
+def detectar_rostros(img):
     # Detecta rostros
     faces = RetinaFace.detect_faces(img)
     
-    # Imprime información de los rostros detectados
-    for key, face in faces.items():
-        print(f"Rostro {key}: {face['facial_area']}")
+    # Si hay rostros detectados, retorna las coordenadas
+    if faces:
+        # Retorna las coordenadas de los rostros detectados como lista de tuplas (x_min, y_min, x_max, y_max)
+        coordenadas = [tuple(int(coord) for coord in face['facial_area']) for face in faces.values()]
+        return coordenadas
+    else:
+        return []
     
-    # Dibuja rectángulos en la imagen (opcional)
-    for face in faces.values():
-        facial_area = face['facial_area']
-        cv2.rectangle(img, (facial_area[2], facial_area[3]), (facial_area[0], facial_area[1]), (255, 0, 0), 2)
     
-    # Muestra la imagen
-    cv2.imshow('Rostros detectados', img)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
 
-
-PathFoto = PathImagen()
-detectar_rostros(PathFoto)
+if __name__ == "__main__":
+    RutaImagen = PathImagen()
+    if RutaImagen:
+        ImaCargada= cargar_imagen(RutaImagen)
+        coordenadas = detectar_rostros(ImaCargada)
+        if coordenadas:
+            print("Rostros detectados:", coordenadas)
+        else:
+            print("No hay rostros en la imagen.")
+    else:
+        print("No se seleccionó ninguna imagen.")
