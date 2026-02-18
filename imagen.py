@@ -1,187 +1,150 @@
-#from PIL import Image
+import cv2
+import numpy as np
+import os
 from tkinter import Tk, filedialog
 from retinaface import RetinaFace
-import cv2
 
+# ==========================================
+# 1. MÉTRICAS AVANZADAS Y DIMENSIONES
+# ==========================================
 
-def PathImagen():
-    root = Tk()
-    root.withdraw()
-    ruta_imagen = filedialog.askopenfilename(
-        title="Seleccionar imagen",
-        filetypes=[("Archivos de imagen", "*.jpg *.jpeg *.png *.bmp *.gif")]
-    )
-    if ruta_imagen:
-        return ruta_imagen
-    else:
-        return None
+def estimar_ruido_real(gris):
+    """Estima el ruido ignorando bordes (variación fina en zonas planas)."""
+    mediana = cv2.medianBlur(gris, 3)
+    residuo = cv2.absdiff(gris, mediana)
+    return np.percentile(residuo, 50)
 
-
-def cargar_imagen(ruta_imagen):
-    # Carga la imagen usando OpenCV
-    img = cv2.imread(ruta_imagen)
+def obtener_metricas(rostro, tam_original):
+    h, w = rostro.shape[:2]
+    area = w * h
+    porcentaje = (area / (tam_original[0] * tam_original[1])) * 100
     
-    # Verifica si la imagen se cargó correctamente
-    if img is None:
-        raise ValueError(f"No se pudo cargar la imagen: {ruta_imagen}")
-    
-    return img
+    gris = cv2.cvtColor(rostro, cv2.COLOR_BGR2GRAY)
+    val_n = cv2.Laplacian(gris, cv2.CV_64F).var()
+    val_r = estimar_ruido_real(gris)
+    val_c = gris.std()
 
-
-def detectar_rostros(img):
-    # Detecta rostros
-    faces = RetinaFace.detect_faces(img)
-    
-    # Si hay rostros detectados, retorna las coordenadas
-    if faces:
-        # Retorna las coordenadas de los rostros detectados como lista de tuplas (x_min, y_min, x_max, y_max)
-        coordenadas = [tuple(int(coord) for coord in face['facial_area']) for face in faces.values()]
-        return coordenadas
-    else:
-        return []
-
-
-def recortar_rostros(img, coordenadas):
-    # Si no hay coordenadas, retorna lista vacía
-    if not coordenadas:
-        return []
-    
-    # Lista para guardar las imágenes recortadas
-    rostros_recortados = []
-    
-    # Obtener dimensiones de la imagen
-    altura, ancho = img.shape[:2]
-    
-    # Recortar cada rostro según sus coordenadas (x_min, y_min, x_max, y_max) con 10% de padding
-    for i, (x_min, y_min, x_max, y_max) in enumerate(coordenadas, 1):
-        # Calcular el ancho y alto del rostro
-        ancho_rostro = x_max - x_min
-        alto_rostro = y_max - y_min
-        
-        # Calcular el padding (10%)
-        padding_x = int(ancho_rostro * 0.1)
-        padding_y = int(alto_rostro * 0.1)
-        
-        # Aplicar padding, asegurando que no salga de los límites de la imagen
-        x_min_padding = max(0, x_min - padding_x)
-        y_min_padding = max(0, y_min - padding_y)
-        x_max_padding = min(ancho, x_max + padding_x)
-        y_max_padding = min(altura, y_max + padding_y)
-        
-        # Recortar con padding
-        rostro = img[y_min_padding:y_max_padding, x_min_padding:x_max_padding]
-        rostros_recortados.append(rostro)
-    
-    return rostros_recortados
-
-
-def obtener_metricas_rostro(rostro_recortado, tamano_original=None):
-    """
-    Calcula valores numéricos y genera las etiquetas de clasificación.
-    """
-    alto, ancho = rostro_recortado.shape[:2]
-    area_pixeles = ancho * alto
-    
-    # --- Cálculos Base ---
-    porcentaje_total = 0
-    if tamano_original:
-        area_original = tamano_original[0] * tamano_original[1]
-        porcentaje_total = (area_pixeles / area_original) * 100
-
-    gris = cv2.cvtColor(rostro_recortado, cv2.COLOR_BGR2GRAY)
-    
-    # Métrica de Nitidez (Varianza de Laplace)
-    valor_blur = cv2.Laplacian(gris, cv2.CV_64F).var()
-    
-    # Métrica de Ruido
-    valor_ruido = cv2.meanStdDev(gris)[1][0][0]
-    
-    # Métrica de Contraste
-    valor_contraste = gris.std()
-
-    # --- Clasificación (Lógica de Umbrales) ---
-    clasificacion = {
-        "tamaño_rostro": "GRANDE" if porcentaje_total > 15 else ("MEDIO" if porcentaje_total >= 7 else "PEQUEÑO"),
-        "nitidez": "ALTA" if valor_blur > 300 else ("MEDIA" if valor_blur >= 120 else "BAJA"),
-        "ruido": "BAJO" if valor_ruido < 15 else ("MEDIO" if valor_ruido <= 30 else "ALTO"),
-        "contraste": "ALTO" if valor_contraste > 45 else ("MEDIO" if valor_contraste >= 25 else "BAJO")
+    clasif = {
+        "tamaño": "GRANDE" if porcentaje > 15 else ("MEDIO" if porcentaje >= 7 else "PEQUEÑO"),
+        "nitidez": "ALTA" if val_n > 300 else ("MEDIA" if val_n >= 120 else "BAJA"),
+        "ruido": "BAJO" if val_r < 3 else ("MEDIO" if val_r <= 6 else "ALTO"),
+        "contraste": "ALTO" if val_c > 50 else ("MEDIO" if val_c >= 30 else "BAJO")
     }
-
-    # Estructura final solicitada
+    
     return {
-        "registro_depuracion": {
-            "area_px": area_pixeles,
-            "porcentaje": round(porcentaje_total, 2),
-            "valor_nitidez": round(valor_blur, 2),
-            "valor_ruido": round(valor_ruido, 2),
-            "valor_contraste": round(valor_contraste, 2)
-        },
-        "clasificacion": clasificacion
+        "raw": {"n": val_n, "r": val_r, "c": val_c},
+        "clasificacion": clasif
     }
 
-def validar_rostro_para_biometria(objeto_metricas):
-    """
-    Función que SOLO lee la estructura de clasificación.
-    Ideal para decidir si el rostro se guarda o se descarta.
-    """
-    c = objeto_metricas["clasificacion"]
+def evaluar_dimensiones(c):
+    biometrico = (c["tamaño"] != "PEQUEÑO" and c["nitidez"] == "ALTA" and c["ruido"] != "ALTO")
+    estetico = (c["contraste"] == "ALTO" and c["ruido"] == "BAJO")
+    restaurable = not (c["tamaño"] == "PEQUEÑO" and c["nitidez"] == "BAJA")
+    return {"biometrico": biometrico, "estetico": estetico, "restaurable": restaurable}
+
+# ==========================================
+# 2. MOTOR DE MEJORA Y REGLA DE ORO
+# ==========================================
+
+def validar_mejora_estricta(m_old, m_new):
+    """Política de protección: prohíbe regresiones y exige ganancias reales."""
+    regresion_ruido = m_new["r"] > (m_old["r"] * 1.05)
+    regresion_nitidez = m_new["n"] < (m_old["n"] * 0.95)
     
-    # Ejemplo de lógica interna de decisión
-    es_apto = (
-        c["tamaño_rostro"] != "PEQUEÑO" and 
-        c["nitidez"] == "ALTA" and 
-        c["ruido"] != "ALTO"
-    )
+    if regresion_ruido or regresion_nitidez:
+        return False, "Regresión detectada (daño a la integridad)"
     
-    return es_apto, c
+    ganancia_n = m_new["n"] > (m_old["n"] * 1.10)
+    ganancia_r = m_new["r"] < (m_old["r"] * 0.90)
     
+    if ganancia_n or ganancia_r:
+        return True, "Mejora técnica validada"
+    
+    return False, "Cambio insignificante"
+
+def ejecutar_mejora_clasica(rostro, res_ini, tam_orig):
+    temp = rostro.copy()
+    m_old = res_ini["raw"]
+    c_old = res_ini["clasificacion"]
+    
+    # 1. Denoise sutil (Solo si es necesario)
+    if c_old["ruido"] == "ALTO":
+        temp = cv2.fastNlMeansDenoisingColored(temp, None, 3, 3, 7, 21)
+    
+    # 2. Sharpen adaptativo
+    if c_old["nitidez"] != "ALTA":
+        gauss = cv2.GaussianBlur(temp, (0, 0), 3)
+        p = 0.8 if c_old["nitidez"] == "BAJA" else 0.4
+        temp = cv2.addWeighted(temp, 1+p, gauss, -p, 0)
+    
+    # 3. CLAHE suave (Contraste)
+    if c_old["contraste"] != "ALTO":
+        lab = cv2.cvtColor(temp, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        temp = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+
+    res_new = obtener_metricas(temp, tam_orig)
+    apto, mensaje = validar_mejora_estricta(m_old, res_new["raw"])
+    
+    if apto:
+        print(f"   [OK] {mensaje}")
+        return temp, res_new["clasificacion"], True
+    
+    print(f"   [!] {mensaje}. Rollback ejecutado.")
+    return rostro, c_old, False
+
+# ==========================================
+# 3. MAIN: DETECCIÓN Y RECONSTRUCCIÓN
+# ==========================================
+
 if __name__ == "__main__":
-    # 1. Seleccionar y cargar imagen
-    RutaImagen = PathImagen()
+    Tk().withdraw()
+    ruta = filedialog.askopenfilename(title="Seleccionar Imagen")
     
-    if RutaImagen:
-        ImaCargada = cargar_imagen(RutaImagen)
-        # Extraemos dimensiones para el cálculo de porcentaje
-        alto_orig, ancho_orig = ImaCargada.shape[:2]
+    if ruta:
+        img_original = cv2.imread(ruta)
+        img_final = img_original.copy()
+        h_orig, w_orig = img_original.shape[:2]
         
-        # 2. Detectar rostros
-        coordenadas = detectar_rostros(ImaCargada)
+        print("Buscando rostros...")
+        faces = RetinaFace.detect_faces(img_original)
         
-        if coordenadas:
-            # 3. Recortar rostros detectados
-            rostros = recortar_rostros(ImaCargada, coordenadas)
+        if not faces:
+            print("No se detectaron rostros."); exit()
+
+        for i, f in enumerate(faces.values()):
+            coords = [int(c) for c in f['facial_area']]
+            x1, y1, x2, y2 = coords
+            recorte = img_original[y1:y2, x1:x2]
             
-            print(f"Se encontraron {len(rostros)} rostro(s). Analizando calidad...\n")
+            res_ini = obtener_metricas(recorte, (w_orig, h_orig))
+            cl_ini = res_ini["clasificacion"]
+            dim_ini = evaluar_dimensiones(cl_ini)
             
-            for i, rostro_img in enumerate(rostros):
-                # 4. Obtener el objeto de métricas y clasificación
-                # Pasamos (ancho, alto) como tamano_original
-                resultado = obtener_metricas_rostro(rostro_img, (ancho_orig, alto_orig))
-                
-                # 5. Uso de la función de validación (Solo lee la clasificación)
-                apto, clasificacion = validar_rostro_para_biometria(resultado)
-                
-                # --- SALIDA POR CONSOLA ---
-                print(f"=== ANÁLISIS ROSTRO {i+1} ===")
-                print(f"Estado: {'✅ APTO' if apto else '❌ NO APTO'}")
-                
-                # Solo lectura de clasificación (lo que pediste)
-                print(f"  > Tamaño:    {clasificacion['tamaño_rostro']}")
-                print(f"  > Nitidez:   {clasificacion['nitidez']}")
-                print(f"  > Ruido:     {clasificacion['ruido']}")
-                print(f"  > Contraste: {clasificacion['contraste']}")
-                
-                # Los números quedan para tu registro/depuración en el objeto 'resultado'
-                # print(f"DEBUG: {resultado['registro_depuracion']}") 
-                print("-" * 30)
-                
-                # Opcional: Mostrar el recorte analizado
-                # cv2.imshow(f"Rostro {i+1}", rostro_img)
+            print(f"\n--- ROSTRO {i+1} ---")
+            print(f"ESTADO: N:{cl_ini['nitidez']} | R:{cl_ini['ruido']} | C:{cl_ini['contraste']}")
             
-            # cv2.waitKey(0)
-            # cv2.destroyAllWindows()
-            
-        else:
-            print("No se detectaron rostros en la imagen seleccionada.")
-    else:
-        print("Operación cancelada: No se seleccionó ningún archivo.")
+            # Lógica de decisión (Solo procesamos si no es óptimo pero es restaurable)
+            if not dim_ini["biometrico"] and not (cl_ini["tamaño"] == "PEQUEÑO"):
+                recorte_mej, cl_fin, exito = ejecutar_mejora_clasica(recorte, res_ini, (w_orig, h_orig))
+                
+                if exito:
+                    # Inserción en la imagen final completa
+                    # Redimensionamos para asegurar match perfecto de matriz
+                    recorte_mej = cv2.resize(recorte_mej, (x2-x1, y2-y1))
+                    img_final[y1:y2, x1:x2] = recorte_mej
+                    
+                    final_dim = evaluar_dimensiones(cl_fin)
+                    status = "✅ APTO" if final_dim["biometrico"] else "⚠️ MEJORADO"
+                    print(f"RESULTADO: {status}")
+                else:
+                    print("RESULTADO: Se mantiene original por falta de ganancia técnica.")
+            else:
+                print("RESULTADO: No requiere mejora o es demasiado pequeño para restauración clásica.")
+
+        # Guardado del producto final
+        output_name = "RESULTADO_RECONSTRUIDO.jpg"
+        cv2.imwrite(output_name, img_final)
+        print(f"\n{'='*50}\nSISTEMA CERRADO: {output_name} guardado con éxito.\n{'='*50}")
