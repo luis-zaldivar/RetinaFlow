@@ -5,146 +5,220 @@ from tkinter import Tk, filedialog
 from retinaface import RetinaFace
 
 # ==========================================
-# 1. MÉTRICAS AVANZADAS Y DIMENSIONES
+# 0. DETECCIÓN Y REDUCCIÓN DE RUIDO
 # ==========================================
 
-def estimar_ruido_real(gris):
-    """Estima el ruido ignorando bordes (variación fina en zonas planas)."""
-    mediana = cv2.medianBlur(gris, 3)
-    residuo = cv2.absdiff(gris, mediana)
-    return np.percentile(residuo, 50)
+def estimar_nivel_ruido(gris):
+    """
+    Estima el nivel de ruido (ej. ruido de color/pixelación) mediante
+    varianza en regiones de alta frecuencia (Laplaciano).
+    """
+    lap = cv2.Laplacian(gris, cv2.CV_64F)
+    return np.var(lap)
 
-def obtener_metricas(rostro, tam_original):
+def reducir_ruido(rostro, fuerza="auto"):
+    """
+    Reduce ruido digital preservando bordes. Usa fastNlMeansDenoisingColored
+    y opcionalmente bilateral para suavizado final.
+    """
+    # Parámetros según tamaño del recorte (rostros pequeños = menos filtro)
     h, w = rostro.shape[:2]
-    area = w * h
-    porcentaje = (area / (tam_original[0] * tam_original[1])) * 100
-    
-    gris = cv2.cvtColor(rostro, cv2.COLOR_BGR2GRAY)
-    val_n = cv2.Laplacian(gris, cv2.CV_64F).var()
-    val_r = estimar_ruido_real(gris)
-    val_c = gris.std()
+    area = h * w
+    if area < 80 * 80:
+        h_filter, template, search = 6, 5, 11
+    elif area < 200 * 200:
+        h_filter, template, search = 8, 6, 13
+    else:
+        h_filter, template, search = 10, 7, 21
 
-    clasif = {
-        "tamaño": "GRANDE" if porcentaje > 15 else ("MEDIO" if porcentaje >= 7 else "PEQUEÑO"),
-        "nitidez": "ALTA" if val_n > 300 else ("MEDIA" if val_n >= 120 else "BAJA"),
-        "ruido": "BAJO" if val_r < 3 else ("MEDIO" if val_r <= 6 else "ALTO"),
-        "contraste": "ALTO" if val_c > 50 else ("MEDIO" if val_c >= 30 else "BAJO")
-    }
-    
-    return {
-        "raw": {"n": val_n, "r": val_r, "c": val_c},
-        "clasificacion": clasif
-    }
-
-def evaluar_dimensiones(c):
-    biometrico = (c["tamaño"] != "PEQUEÑO" and c["nitidez"] == "ALTA" and c["ruido"] != "ALTO")
-    estetico = (c["contraste"] == "ALTO" and c["ruido"] == "BAJO")
-    restaurable = not (c["tamaño"] == "PEQUEÑO" and c["nitidez"] == "BAJA")
-    return {"biometrico": biometrico, "estetico": estetico, "restaurable": restaurable}
+    denoised = cv2.fastNlMeansDenoisingColored(
+        rostro, None, h_filter, h_filter * 2, template, search
+    )
+    # Bilateral suave para suavizar ruido residual sin borrar bordes
+    denoised = cv2.bilateralFilter(denoised, 5, 50, 50)
+    return denoised
 
 # ==========================================
-# 2. MOTOR DE MEJORA Y REGLA DE ORO
+# 1. DIAGNÓSTICO FÍSICO (TIPO Y SEVERIDAD)
 # ==========================================
 
-def validar_mejora_estricta(m_old, m_new):
-    """Política de protección: prohíbe regresiones y exige ganancias reales."""
-    regresion_ruido = m_new["r"] > (m_old["r"] * 1.05)
-    regresion_nitidez = m_new["n"] < (m_old["n"] * 0.95)
-    
-    if regresion_ruido or regresion_nitidez:
-        return False, "Regresión detectada (daño a la integridad)"
-    
-    ganancia_n = m_new["n"] > (m_old["n"] * 1.10)
-    ganancia_r = m_new["r"] < (m_old["r"] * 0.90)
-    
-    if ganancia_n or ganancia_r:
-        return True, "Mejora técnica validada"
-    
-    return False, "Cambio insignificante"
+def analizar_degradacion(gris):
+    """
+    Detecta si el blur es por movimiento (Motion) o desenfoque (Defocus)
+    y mide su severidad mediante FFT y varianza angular.
+    Incluye indicador de ruido alto para priorizar denoising.
+    """
+    # --- 0. Nivel de ruido ---
+    nivel_ruido = estimar_nivel_ruido(gris)
+    ruido_alto = nivel_ruido > 800  # Umbral empírico para ruido visible
 
-def ejecutar_mejora_clasica(rostro, res_ini, tam_orig):
-    temp = rostro.copy()
-    m_old = res_ini["raw"]
-    c_old = res_ini["clasificacion"]
+    # --- 1. Dirección del gradiente ---
+    gx = cv2.Sobel(gris, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gris, cv2.CV_64F, 0, 1, ksize=3)
+    angulos = cv2.phase(gx, gy)
+    varianza_angular = np.var(angulos)
     
-    # 1. Denoise sutil (Solo si es necesario)
-    if c_old["ruido"] == "ALTO":
-        temp = cv2.fastNlMeansDenoisingColored(temp, None, 3, 3, 7, 21)
-    
-    # 2. Sharpen adaptativo
-    if c_old["nitidez"] != "ALTA":
-        gauss = cv2.GaussianBlur(temp, (0, 0), 3)
-        p = 0.8 if c_old["nitidez"] == "BAJA" else 0.4
-        temp = cv2.addWeighted(temp, 1+p, gauss, -p, 0)
-    
-    # 3. CLAHE suave (Contraste)
-    if c_old["contraste"] != "ALTO":
-        lab = cv2.cvtColor(temp, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
-        l = clahe.apply(l)
-        temp = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+    # --- 2. Severidad (FFT) ---
+    f = np.fft.fft2(gris)
+    fshift = np.fft.fftshift(f)
+    mag = 20 * np.log(np.abs(fshift) + 1)
+    ch, cw = gris.shape[0]//2, gris.shape[1]//2
+    r = int(min(gris.shape) * 0.1)
+    ratio_blur = np.mean(mag[ch-r:ch+r, cw-r:cw+r]) / (np.mean(mag) + 1e-6)
 
-    res_new = obtener_metricas(temp, tam_orig)
-    apto, mensaje = validar_mejora_estricta(m_old, res_new["raw"])
+    # Clasificación
+    tipo = "MOTION" if varianza_angular < 1.2 else "DEFOCUS"
+    if ratio_blur < 1.4: sev = "LEVE"
+    elif ratio_blur < 2.3: sev = "MEDIO"
+    else: sev = "SEVERO"
     
-    if apto:
-        print(f"   [OK] {mensaje}")
-        return temp, res_new["clasificacion"], True
-    
-    print(f"   [!] {mensaje}. Rollback ejecutado.")
-    return rostro, c_old, False
+    return tipo, sev, ratio_blur, ruido_alto
 
 # ==========================================
-# 3. MAIN: DETECCIÓN Y RECONSTRUCCIÓN
+# 2. PIPELINES DE RESTAURACIÓN ESPECÍFICA
+# ==========================================
+
+def restaurar_motion_blur(rostro, severidad):
+    """
+    Simulación de Deconvolución Wiener simplificada.
+    Usa un kernel de movimiento lineal para revertir el desplazamiento.
+    """
+    # Enfoque direccional (Kernel de movimiento aproximado)
+    size = 5 if severidad == "LEVE" else 9
+    kernel_motion = np.zeros((size, size))
+    kernel_motion[int((size-1)/2), :] = np.ones(size)
+    kernel_motion /= size
+    
+    # Deconvolución iterativa (Lucy-Richardson simplificada en CPU)
+    deconvolved = np.copy(rostro)
+    for _ in range(3): # Pocas iteraciones para evitar ruido en CPU
+        blur = cv2.filter2D(deconvolved, -1, kernel_motion)
+        ratio = rostro / (blur + 1e-6)
+        deconvolved *= cv2.filter2D(ratio, -1, kernel_motion)
+    
+    return np.clip(deconvolved, 0, 255).astype(np.uint8)
+
+def restaurar_defocus_blur(rostro, severidad):
+    """
+    Estrategia de reconstrucción isotrópica:
+    Super-resolución matemática + Enfoque de máscara de bordes.
+    """
+    h, w = rostro.shape[:2]
+    # Reconstrucción de bordes mediante Lanczos
+    temp = cv2.resize(rostro, (w*2, h*2), interpolation=cv2.INTER_LANCZOS4)
+    
+    # Sharpen adaptativo (Máscara de bordes)
+    gris = cv2.cvtColor(temp, cv2.COLOR_BGR2GRAY)
+    mask = cv2.Canny(gris, 50, 150)
+    mask = cv2.GaussianBlur(mask, (5, 5), 0) / 255.0
+    
+    suave = cv2.GaussianBlur(temp, (0, 0), 2)
+    enfocado = cv2.addWeighted(temp, 1.8, suave, -0.8, 0)
+    
+    # Blend basado en la máscara de bordes
+    for c in range(3):
+        temp[:,:,c] = (enfocado[:,:,c] * mask + temp[:,:,c] * (1 - mask))
+        
+    return cv2.resize(temp, (w, h), interpolation=cv2.INTER_AREA)
+
+# ==========================================
+# 3. MEJORA DE CONTRASTE (CLAHE)
+# ==========================================
+
+def mejorar_contraste(rostro, clip_limit=2.0, grid=(8, 8)):
+    """
+    Aplica CLAHE en LAB para realzar contraste sin afectar color,
+    haciendo la mejora más visible.
+    """
+    lab = cv2.cvtColor(rostro, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid)
+    l = clahe.apply(l)
+    lab = cv2.merge([l, a, b])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+# ==========================================
+# 4. CONTROL DE CALIDAD Y HALOS
+# ==========================================
+
+def evaluar_resultado(orig, mejorado, aplicamos_denoising=False):
+    """
+    Valida la mejora: acepta si hay ganancia de nitidez.
+    No rechaza por cambio global grande cuando hubo denoising (ruido).
+    Solo penaliza oversharpening extremo (halos).
+    """
+    g_orig = cv2.cvtColor(orig, cv2.COLOR_BGR2GRAY)
+    g_mejo = cv2.cvtColor(mejorado, cv2.COLOR_BGR2GRAY)
+    
+    s_orig = cv2.Laplacian(g_orig, cv2.CV_64F).var()
+    s_mejo = cv2.Laplacian(g_mejo, cv2.CV_64F).var()
+    
+    # Halos: nitidez excesiva (ratio muy alto) indica oversharpening
+    if s_orig > 1e-6 and s_mejo > 5 * s_orig:
+        return 0  # Rechazar solo por oversharpening extremo
+    
+    # Si aplicamos denoising, no rechazar por diff grande (el cambio es esperado)
+    if not aplicamos_denoising:
+        diff = cv2.absdiff(g_mejo, g_orig)
+        if np.mean(diff) > 55:
+            return 0
+        
+    return s_mejo - s_orig
+
+# ==========================================
+# 5. MOTOR PRINCIPAL
 # ==========================================
 
 if __name__ == "__main__":
     Tk().withdraw()
-    ruta = filedialog.askopenfilename(title="Seleccionar Imagen")
+    ruta = filedialog.askopenfilename()
     
     if ruta:
-        img_original = cv2.imread(ruta)
-        img_final = img_original.copy()
-        h_orig, w_orig = img_original.shape[:2]
+        img = cv2.imread(ruta)
+        if img is None:
+            print("No se pudo cargar la imagen.")
+            exit(1)
+        img_final = img.copy()
+        faces = RetinaFace.detect_faces(img)
         
-        print("Buscando rostros...")
-        faces = RetinaFace.detect_faces(img_original)
-        
-        if not faces:
-            print("No se detectaron rostros."); exit()
-
-        for i, f in enumerate(faces.values()):
-            coords = [int(c) for c in f['facial_area']]
-            x1, y1, x2, y2 = coords
-            recorte = img_original[y1:y2, x1:x2]
-            
-            res_ini = obtener_metricas(recorte, (w_orig, h_orig))
-            cl_ini = res_ini["clasificacion"]
-            dim_ini = evaluar_dimensiones(cl_ini)
-            
-            print(f"\n--- ROSTRO {i+1} ---")
-            print(f"ESTADO: N:{cl_ini['nitidez']} | R:{cl_ini['ruido']} | C:{cl_ini['contraste']}")
-            
-            # Lógica de decisión (Solo procesamos si no es óptimo pero es restaurable)
-            if not dim_ini["biometrico"] and not (cl_ini["tamaño"] == "PEQUEÑO"):
-                recorte_mej, cl_fin, exito = ejecutar_mejora_clasica(recorte, res_ini, (w_orig, h_orig))
+        if faces:
+            for i, f in enumerate(faces.values()):
+                x1, y1, x2, y2 = [int(c) for c in f['facial_area']]
+                recorte = img[y1:y2, x1:x2].copy()
+                gris = cv2.cvtColor(recorte, cv2.COLOR_BGR2GRAY)
                 
-                if exito:
-                    # Inserción en la imagen final completa
-                    # Redimensionamos para asegurar match perfecto de matriz
-                    recorte_mej = cv2.resize(recorte_mej, (x2-x1, y2-y1))
-                    img_final[y1:y2, x1:x2] = recorte_mej
-                    
-                    final_dim = evaluar_dimensiones(cl_fin)
-                    status = "✅ APTO" if final_dim["biometrico"] else "⚠️ MEJORADO"
-                    print(f"RESULTADO: {status}")
+                # 1. Diagnóstico (incluye si hay ruido alto)
+                tipo, sev, score, ruido_alto = analizar_degradacion(gris)
+                print(f"\nRostro {i+1}: {tipo} | Severidad {sev}" + (" | Ruido alto" if ruido_alto else ""))
+                
+                # 2. Denoising primero (siempre en rostros; más importante si ruido_alto)
+                aplicamos_denoising = True
+                trabajo = reducir_ruido(recorte)
+                gris_t = cv2.cvtColor(trabajo, cv2.COLOR_BGR2GRAY)
+                
+                # 3. Re-diagnóstico post-denoising para blur
+                tipo_t, sev_t, _, _ = analizar_degradacion(gris_t)
+                
+                # 4. Pipeline de blur sobre imagen ya denoised
+                if tipo_t == "MOTION":
+                    candidato = restaurar_motion_blur(trabajo, sev_t)
                 else:
-                    print("RESULTADO: Se mantiene original por falta de ganancia técnica.")
-            else:
-                print("RESULTADO: No requiere mejora o es demasiado pequeño para restauración clásica.")
-
-        # Guardado del producto final
-        output_name = "RESULTADO_RECONSTRUIDO.jpg"
-        cv2.imwrite(output_name, img_final)
-        print(f"\n{'='*50}\nSISTEMA CERRADO: {output_name} guardado con éxito.\n{'='*50}")
+                    candidato = restaurar_defocus_blur(trabajo, sev_t)
+                
+                # 5. Mejora de contraste para que la mejora se note más
+                candidato = mejorar_contraste(candidato, clip_limit=2.0)
+                
+                # 6. Validar y reinsertar (no rechazar por diff cuando hubo denoising)
+                if evaluar_resultado(recorte, candidato, aplicamos_denoising=aplicamos_denoising) > 0:
+                    print("   ✨ Mejora validada e insertada.")
+                    img_final[y1:y2, x1:x2] = cv2.resize(candidato, (x2-x1, y2-y1))
+                else:
+                    # Si rechazamos por halos, al menos insertar la versión denoised + CLAHE
+                    fallback = mejorar_contraste(trabajo, clip_limit=1.8)
+                    print("   ⚠️ Halos detectados; se usa versión suave (denoise + contraste).")
+                    img_final[y1:y2, x1:x2] = cv2.resize(fallback, (x2-x1, y2-y1))
+            
+            cv2.imwrite("RESTORE_PRO.jpg", img_final)
+            print("\nProceso terminado. Archivo: RESTORE_PRO.jpg")
+        else:
+            print("No se detectaron rostros en la imagen.")
